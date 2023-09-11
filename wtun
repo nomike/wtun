@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""
+This script sends a notification if a new entry is available on the Wiener WohnTicket website.
+
+Usage: wtun [options]
+
+    --session-cookie=<session_cookie>   Session cookie for the Wiener WohnTicket website. # PHPSESSID=mtiui5h2nqnrosu60icu008oht; StickySession=app02       
+    --send-email                        Send notification via email.
+    --no-send-email                     Do not send notification via email.
+    --from-email=<from_email>           Email address to send the notification from.
+    --smtp-password=<smtp_password>     Password for the SMTP server.
+    --to-email=<to_email>               Email address to send the notification to.
+    --smtp-server=<smtp_server>         SMTP server to use.
+    -f --flat-file=<flat_file>          File to store the list of flats.
+    -v --verbose                        Be more verbose.
+    -h --help                           Show this screen.
+"""
+
+import json
+import logging
+import re
+import smtplib
+import sys
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import requests
+from bs4 import BeautifulSoup
+from docopt import docopt
+from markdownify import markdownify
+
+
+def fetch_flats(base_url, path):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/116.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Referer': 'https://wohnungssuche.wohnberatung-wien.at/?page=suche&art=gefoerdert',
+        'Cookie': parameters['--session-cookie'],
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1'
+    }
+
+    url = base_url + path
+    logging.debug(f'Fetching flat ids from {url}')
+    response = requests.get(url, headers=headers)
+    logging.debug(f'Response status code: {response.status_code}')
+    logging.debug('Parsing response')
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    logging.debug('Finding flats')
+    flats_html = {flat.find('a', class_='img-link')['href'].split('=')[-1] : flat for flat in soup.find_all('div', class_='media-wohnung')}
+    for (flat_id, html) in flats_html.items():
+        for a in html.find_all('a'):
+            href = a.get('href')
+            if href and not href.startswith('http'):
+                a['href'] = base_url + href
+        flats_html[flat_id] = html
+    flats = {flat_id: re.sub(r'\n{3,}', '\n', markdownify(html.__str__().strip(" \n")).strip(" \n")) for (flat_id, html) in flats_html.items()}
+    logging.debug(f'Found {len(flats)} flats on the current page')
+
+    logging.debug('Check if there is a next page')
+    next_page = soup.find('a', attrs={'aria-label': 'nächste Seite'})
+    if next_page and next_page['href'] != '#':
+        logging.debug('Load flats from next page')
+        flats.update(fetch_flats(base_url, next_page['href']))
+    else:
+        logging.debug('No next page found')
+
+    return flats
+
+
+if __name__ == "__main__":
+    global parameters
+    parameters = docopt(__doc__, version='wtun 0.1')
+
+    if parameters['--verbose']:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+
+    # check if flat-file exists
+    try:
+        logging.debug(f'Loading list of old flat ids from file {parameters["--flat-file"]}')
+        old_flats = json.load(open(parameters["--flat-file"], 'r'))
+    except FileNotFoundError:
+        logging.debug('Flat file not found. Will be created at the end.')
+        old_flats = {}
+    flats = fetch_flats('https://wohnungssuche.wohnberatung-wien.at', '/?page=suche&art=gefoerdert&&upp=200&p=1')
+    logging.debug(f'Found {len(flats)} flat ids in total')
+
+    logging.debug('Check if there are new flats')
+    new_flat_ids = [flat_id for flat_id in flats.keys() if flat_id not in old_flats]
+    
+    if len(new_flat_ids) > 0:
+        logging.info(f'{len(new_flat_ids)} new flats found:')
+        flat_list_text = ""
+
+        for flat_id in new_flat_ids:
+            flat_list_text = flat_list_text + "\n--------------------\n"
+            flat_list_text = flat_list_text + flats[flat_id]
+        
+        print(flat_list_text)
+        if not parameters['--no-send-email']:
+            logging.debug('Sending notification email')
+            email = parameters['--from-email']
+            password = parameters['--smtp-password']
+            send_to_email = parameters['--to-email']
+            subject = f'{len(new_flat_ids)} new flats found'
+            message = flat_list_text
+
+
+            msg = MIMEMultipart()
+            msg['From'] = email
+            msg['To'] = send_to_email
+            msg['Subject'] = subject
+            msg.attach(MIMEText(message, 'plain'))
+            # send message
+            server = smtplib.SMTP(parameters['--smtp-server'], 587)
+            server.starttls()
+            server.login(email, password)
+            text = msg.as_string()
+            server.sendmail(email, send_to_email, text)
+            server.quit()
+
+        logging.debug(f'Saving list of new flat ids to file {parameters["--flat-file"]}')
+        json.dump(flats, open(parameters["--flat-file"], 'w'), indent=4, sort_keys=True)
+    else:
+        logging.info('No new flats found.')
